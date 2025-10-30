@@ -1,2 +1,2 @@
 # NVInstall
-Automatic NVIDIA driver installation tool for Linux
+Open-source NVIDIA Driver Installer for Linux 
