@@ -11,14 +11,42 @@ import os
 import platform
 import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Tuple
 
 try:
     from nercone_modern.logging import ModernLogging  # type: ignore
     from nercone_modern.progressbar import ModernProgressBar  # type: ignore
-except ImportError as exc:
-    NerconeModern = None  # type: ignore # pylint: disable=invalid-name
+except ImportError:
+    class ModernLogging:  # type: ignore
+        def __init__(self, process_name: str = "NVInstall") -> None:
+            self.process_name = process_name
+
+        def log(self, msg: str, level: str = "INFO") -> None:
+            print(f"[{self.process_name}][{level}] {msg}")
+
+    class ModernProgressBar:  # type: ignore
+        def __init__(self, total: int, process_name: str = "Progress") -> None:
+            self.total = max(total, 1)
+            self.cur = 0
+            self.process_name = process_name
+
+        def start(self) -> None:
+            self._render()
+
+        def update(self) -> None:
+            self.cur += 1
+            self._render()
+
+        def finish(self) -> None:
+            self.cur = self.total
+            self._render()
+            print()
+
+        def _render(self) -> None:
+            pct = int(self.cur * 100 / self.total)
+            bar = "#" * (pct // 5)
+            print(f"\r[{self.process_name}] [{bar:<20}] {pct:3d}% ", end="", flush=True)
 
 VERSION = "v1.0.0"
 
@@ -26,7 +54,7 @@ VERSION = "v1.0.0"
 class InstallerConfig:
     distro: str
     arch: str
-    module: str  # "open" "proprietary"
+    module: str  # "open" or "proprietary"
     variant: str  # "full", "compute-only", "desktop-only"
     dry_run: bool
 
@@ -37,18 +65,18 @@ class InstallerConfig:
         self.variant = self.variant.lower()
 
 def detect_os_release() -> Tuple[str, str]:
-    distro_id = ''
-    version_id = ''
+    distro_id = ""
+    version_id = ""
     try:
-        with open('/etc/os-release', 'r', encoding='utf-8') as f:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
             for line in f:
-                if '=' not in line:
+                if "=" not in line:
                     continue
-                key, value = line.strip().split('=', 1)
+                key, value = line.strip().split("=", 1)
                 value = value.strip('"')
-                if key == 'ID':
+                if key == "ID":
                     distro_id = value
-                elif key == 'VERSION_ID':
+                elif key == "VERSION_ID":
                     version_id = value
     except FileNotFoundError:
         distro_id = platform.system().lower()
@@ -56,150 +84,163 @@ def detect_os_release() -> Tuple[str, str]:
 
 def detect_architecture() -> str:
     machine = platform.machine().lower()
-    if machine in ('x86_64', 'amd64'):
-        return 'x86_64'
-    if machine in ('aarch64', 'arm64', 'armv8'):
-        return 'sbsa'
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    if machine in ("aarch64", "arm64", "armv8"):
+        return "sbsa"
     return machine
 
+def distro_key(distro_id: str, version_id: str) -> str:
+    d = distro_id.lower()
+    v = version_id.lower()
+    if d == "ubuntu" and v.startswith("22.04"):
+        return "ubuntu22.04"
+    if d == "debian" and v.startswith("12"):
+        return "debian12"
+    if d == "fedora":
+        return "fedora42"
+    if d in ("opensuse", "opensuse-leap", "suse", "sles"):
+        return "opensuse15"
+    if d in ("rhel", "redhat"):
+        if v.startswith("8"):
+            return "rhel8"
+        if v.startswith("9"):
+            return "rhel9"
+        if v.startswith("10"):
+            return "rhel10"
+    if d in ("rocky", "almalinux", "oraclelinux"):
+        if v.startswith("8"):
+            return "rhel8"
+        if v.startswith("9"):
+            return "rhel9"
+        if v.startswith("10"):
+            return "rhel10"
+    if d in ("amzn", "amazon", "amazonlinux", "amazon linux") and ("2023" in v or v == "2023"):
+        return "amazonlinux2023"
+    if d in ("azurelinux", "azure", "azl", "azlinux") and (v.startswith("3") or v == "3"):
+        return "azurelinux3"
+    return f"{d}{v and '-'+v}"
+
 def run_command(cmd: str, logger: object, dry_run: bool, use_sudo: bool) -> None:
-    full_cmd = cmd
-    if use_sudo:
-        full_cmd = f"sudo -E {cmd}"
-    logger.log(f'$ {full_cmd}', level='INFO')
+    full_cmd = f"sudo -E {cmd}" if use_sudo else cmd
+    logger.log(f"$ {full_cmd}", level="INFO")
     if dry_run:
         return
     result = subprocess.run(full_cmd, shell=True)
     if result.returncode != 0:
-        logger.log(
-            f'Command failed with exit code {result.returncode}', level='CRITICAL'
-        )
+        logger.log(f"Command failed with exit code {result.returncode}", level="CRITICAL")
         sys.exit(result.returncode)
 
-def build_commands(config: InstallerConfig) -> List[str]:
+def _warn_variant_if_needed(logger: ModernLogging, variant: str) -> None:
+    if variant in ("compute-only", "desktop-only"):
+        logger.log(
+            "Notice: current distro recipes do not separate compute-only/desktop-only. "
+            f'Variant "{variant}" will be treated as "full".',
+            level="WARNING",
+        )
+
+def build_commands(config: InstallerConfig, logger: ModernLogging) -> List[str]:
     commands: List[str] = []
-    distro = config.distro
-    arch = config.arch
-    module = config.module  # open, proprietary
-    variant = config.variant  # full, compute-only, desktop-only
-    if distro in ('ubuntu', 'debian'):
-        commands.append('apt update')
-        commands.append('apt install -y linux-headers-$(uname -r)')
-        if distro == 'debian':
-            commands.append('add-apt-repository contrib')
-        repo_arch = 'x86_64' if arch == 'x86_64' else 'sbsa'
-        keyring_url = (
-            f'https://developer.download.nvidia.com/compute/cuda/repos/{distro}/'
-            f'{repo_arch}/cuda-keyring_1.1-1_all.deb'
-        )
-        commands.append(
-            f'wget -O /tmp/cuda-keyring.deb {keyring_url} || '
-            f'curl -fsSL {keyring_url} -o /tmp/cuda-keyring.deb'
-        )
-        commands.append('dpkg -i /tmp/cuda-keyring.deb')
-        commands.append('apt update')
-        if module == 'open':
-            if variant == 'compute-only':
-                commands.append('apt install -y nvidia-driver-cuda nvidia-kernel-open-dkms')
-            elif variant == 'desktop-only':
-                commands.append('apt install -y nvidia-driver nvidia-kernel-open-dkms')
-            else:  # full
-                commands.append('apt install -y nvidia-open')
-        else:  # proprietary
-            if variant == 'compute-only':
-                commands.append('apt install -y nvidia-driver-cuda nvidia-kernel-dkms')
-            elif variant == 'desktop-only':
-                commands.append('apt install -y nvidia-driver nvidia-kernel-dkms')
-            else:
-                commands.append('apt install -y cuda-drivers')
-    elif distro in ('fedora'):
-        commands.append('dnf install -y kernel-devel-matched kernel-headers')
-        repo_arch = 'x86_64' if arch == 'x86_64' else 'sbsa'
-        repo_url = (
-            f'https://developer.download.nvidia.com/compute/cuda/repos/{distro}/'
-            f'{repo_arch}/cuda-{distro}.repo'
-        )
-        commands.append(
-            f'dnf config-manager addrepo --from-repofile={repo_url}'
-        )
-        commands.append('dnf clean expire-cache')
-        if module == 'open':
-            commands.append('dnf module enable -y nvidia-driver:open-dkms')
+    key = distro_key(config.distro, detect_os_release()[1])
+    module = config.module
+    _warn_variant_if_needed(logger, config.variant)
+
+    if key == "amazonlinux2023":
+        commands += [
+            "dnf upgrade -y",
+            "dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/amzn2023/x86_64/cuda-amzn2023.repo",
+            "dnf clean all",
+        ]
+        if module == "open":
+            commands.append("dnf -y module install nvidia-driver:open-dkms")
         else:
-            commands.append('dnf module enable -y nvidia-driver:latest-dkms')
-        if module == 'open':
-            if variant == 'compute-only':
-                commands.append('dnf install -y nvidia-driver-cuda kmod-nvidia-open-dkms')
-            elif variant == 'desktop-only':
-                commands.append('dnf install -y nvidia-driver kmod-nvidia-open-dkms')
-            else:
-                commands.append('dnf install -y nvidia-open')
+            commands.append("dnf -y module install nvidia-driver:latest-dkms")
+
+    elif key == "azurelinux3":
+        commands += [
+            "tdnf upgrade -y",
+            "curl https://developer.download.nvidia.com/compute/cuda/repos/azl3/x86_64/cuda-azl3.repo | tee /etc/yum.repos.d/cuda-azl3.repo",
+            "tdnf -y install azurelinux-repos-extended",
+            "tdnf clean all",
+        ]
+        commands.append("tdnf -y install nvidia-open")
+
+    elif key == "debian12":
+        commands += [
+            "apt-get upgrade -y",
+            "wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb",
+            "dpkg -i cuda-keyring_1.1-1_all.deb",
+            "apt-get update",
+        ]
+        if module == "open":
+            commands.append("apt-get install -y nvidia-open")
         else:
-            if variant == 'compute-only':
-                commands.append('dnf install -y nvidia-driver-cuda kmod-nvidia-latest-dkms')
-            elif variant == 'desktop-only':
-                commands.append('dnf install -y nvidia-driver kmod-nvidia-latest-dkms')
-            else:
-                commands.append('dnf install -y cuda-drivers')
-    elif distro in ('rhel', 'rocky', 'almalinux', 'oraclelinux', 'amazon', 'amazonlinux'):
-        commands.append('dnf install -y kernel-devel-$(uname -r) kernel-headers')
-        repo_arch = 'x86_64' if arch == 'x86_64' else 'sbsa'
-        repo_url = (
-            f'https://developer.download.nvidia.com/compute/cuda/repos/{distro}/'
-            f'{repo_arch}/cuda-{distro}.repo'
-        )
-        commands.append(
-            f'dnf config-manager --add-repo {repo_url}'
-        )
-        commands.append('dnf clean expire-cache')
-        if module == 'open':
-            commands.append('dnf module enable -y nvidia-driver:open-dkms')
+            commands.append("apt-get install -y cuda-drivers")
+
+    elif key == "fedora42":
+        commands += [
+            "dnf upgrade -y",
+            "dnf config-manager addrepo --from-repofile https://developer.download.nvidia.com/compute/cuda/repos/fedora42/x86_64/cuda-fedora42.repo",
+            "dnf clean all",
+        ]
+        if module == "open":
+            commands.append("dnf -y install nvidia-open")
         else:
-            commands.append('dnf module enable -y nvidia-driver:latest-dkms')
-        if module == 'open':
-            if variant == 'compute-only':
-                commands.append('dnf install -y nvidia-driver-cuda kmod-nvidia-open-dkms')
-            elif variant == 'desktop-only':
-                commands.append('dnf install -y nvidia-driver kmod-nvidia-open-dkms')
-            else:
-                commands.append('dnf install -y nvidia-open')
+            commands.append("dnf -y install cuda-drivers")
+
+    elif key == "opensuse15":
+        commands += [
+            "zypper update -y",
+            "zypper addrepo https://developer.download.nvidia.com/compute/cuda/repos/opensuse15/x86_64/cuda-opensuse15.repo",
+            "zypper refresh",
+        ]
+        if module == "open":
+            commands.append("zypper install -y nvidia-open")
         else:
-            if variant == 'compute-only':
-                commands.append('dnf install -y nvidia-driver-cuda kmod-nvidia-latest-dkms')
-            elif variant == 'desktop-only':
-                commands.append('dnf install -y nvidia-driver kmod-nvidia-latest-dkms')
-            else:
-                commands.append('dnf install -y cuda-drivers')
-    elif distro in ('suse', 'opensuse-leap', 'opensuse', 'sles'):
-        commands.append('zypper --non-interactive install -y kernel-default-devel=$(uname -r | sed "s/-default//")')
-        repo_arch = 'x86_64' if arch == 'x86_64' else 'sbsa'
-        repo_url = (
-            f'https://developer.download.nvidia.com/compute/cuda/repos/{distro}/'
-            f'{repo_arch}/cuda-{distro}.repo'
-        )
-        commands.append(f'zypper addrepo {repo_url}')
-        commands.append('zypper --non-interactive refresh')
-        if module == 'open':
-            if variant == 'compute-only':
-                commands.append('zypper --non-interactive install -y nvidia-compute-G06 nvidia-open-driver-G06')
-            elif variant == 'desktop-only':
-                commands.append('zypper --non-interactive install -y nvidia-video-G06 nvidia-open-driver-G06')
-            else:
-                commands.append('zypper --non-interactive install -y nvidia-open')
+            commands.append("zypper install -y cuda-drivers")
+
+    elif key in ("rhel8", "rhel9"):
+        ver = "8" if key == "rhel8" else "9"
+        commands += [
+            "dnf upgrade -y",
+            f"dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel{ver}/x86_64/cuda-rhel{ver}.repo",
+            "dnf clean all",
+        ]
+        if module == "open":
+            commands.append("dnf -y module install nvidia-driver:open-dkms")
         else:
-            if variant == 'compute-only':
-                commands.append('zypper --non-interactive install -y nvidia-compute-G06 nvidia-driver-G06')
-            elif variant == 'desktop-only':
-                commands.append('zypper --non-interactive install -y nvidia-video-G06 nvidia-driver-G06')
-            else:
-                commands.append('zypper --non-interactive install -y cuda-drivers')
+            commands.append("dnf -y module install nvidia-driver:latest-dkms")
+
+    elif key == "rhel10":
+        commands += [
+            "dnf upgrade -y",
+            "dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel10/x86_64/cuda-rhel10.repo",
+        ]
+        if module == "open":
+            commands.append("dnf -y install nvidia-open")
+        else:
+            commands.append("dnf -y install cuda-drivers")
+
+    elif key == "ubuntu22.04":
+        commands += [
+            "apt-get upgrade -y",
+            "wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb",
+            "dpkg -i cuda-keyring_1.1-1_all.deb",
+            "apt-get update",
+        ]
+        if module == "open":
+            commands.append("apt-get install -y nvidia-open")
+        else:
+            commands.append("apt-get install -y cuda-drivers")
+
     else:
         msg = (
-            f'Distribution/OS "{distro}" is not supported by this installer. '
-            'Supported distros include ubuntu, debian, fedora, rhel/rocky/amazon '
-            'and suse/openSUSE.'
+            f'Distribution/OS "{config.distro}" (normalized "{key}") is not supported by this recipe. '
+            "Supported targets: amazonlinux2023, azurelinux3, debian12, fedora42, "
+            "opensuse15, rhel8, rhel9, rhel10, ubuntu22.04."
         )
         raise NotImplementedError(msg)
+
     return commands
 
 def main() -> None:
@@ -208,47 +249,37 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="nvinstall",
-        description='Automatic NVIDIA driver installation tool',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Automatic NVIDIA driver installation tool",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        '--distro',
+        "--distro",
         default=distro_id,
-        help='Linux distribution ID (e.g. ubuntu, debian, fedora, rhel, suse)'
+        help="Linux distribution ID (e.g. ubuntu, debian, fedora, rhel, opensuse, amzn, azurelinux)",
     )
     parser.add_argument(
-        '--arch',
+        "--arch",
         default=default_arch,
-        help='CPU architecture (x86_64 or sbsa).  Detected from platform by default.'
+        help="CPU architecture (x86_64 or sbsa). Detected from platform by default.",
     )
     parser.add_argument(
-        '--module',
-        choices=['open', 'proprietary'],
-        default='open',
-        help='Choose open or proprietary kernel modules.'
+        "--module",
+        choices=["open", "proprietary"],
+        default="open",
+        help="Choose open or proprietary kernel modules.",
     )
     parser.add_argument(
-        '--variant',
-        choices=['full', 'compute-only', 'desktop-only'],
-        default='full',
-        help='Select installation variant: full installs all components; '
-             'compute-only installs only compute libraries; desktop-only installs '
-             'display components without compute parts.'
+        "--variant",
+        choices=["full", "compute-only", "desktop-only"],
+        default="full",
+        help="Variant is currently treated as full on all supported distros.",
     )
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Print commands instead of executing them.'
+        "--dry-run",
+        action="store_true",
+        help="Print commands instead of executing them.",
     )
     args = parser.parse_args()
-
-    config = InstallerConfig(
-        distro=args.distro,
-        arch=args.arch,
-        module=args.module,
-        variant=args.variant,
-        dry_run=args.dry_run
-    )
 
     logger = ModernLogging(process_name="NVInstall")
     logger.log(f"NVInstall {VERSION} by Nercone(DiamondGotCat)")
@@ -257,26 +288,35 @@ def main() -> None:
     logger.log("")
 
     logger.log("-- Installation information --")
-    logger.log(f"Linux Distribution: {args.distro}")
+    logger.log(f"Linux Distribution: {args.distro} ({distro_version})")
     logger.log(f"CPU Architecture: {args.arch}")
     logger.log(f"NVIDIA Driver Module: {args.module}")
     logger.log(f"NVIDIA Driver Variant: {args.variant}")
     logger.log(f"Options: dry_run={'True' if args.dry_run else 'False'}")
     logger.log("")
 
+    config = InstallerConfig(
+        distro=args.distro,
+        arch=args.arch,
+        module=args.module,
+        variant=args.variant,
+        dry_run=args.dry_run,
+    )
+
     try:
-        commands = build_commands(config)
+        commands = build_commands(config, logger)
     except NotImplementedError as exc:
-        logger.log(str(exc), level='CRITICAL')
+        logger.log(str(exc), level="CRITICAL")
         sys.exit(1)
-    progress_bar = ModernProgressBar(total=len(commands), process_name='Driver installation')
+
+    progress_bar = ModernProgressBar(total=len(commands), process_name="Driver installation")
     progress_bar.start()
-    use_sudo = os.name != 'nt' and os.geteuid() != 0
+    use_sudo = os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() != 0
     for cmd in commands:
         run_command(cmd, logger, config.dry_run, use_sudo)
         progress_bar.update()
     progress_bar.finish()
-    logger.log('NVIDIA driver installation completed successfully.', level='INFO')
+    logger.log("NVIDIA driver installation completed.", level="INFO")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
